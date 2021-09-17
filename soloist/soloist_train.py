@@ -12,9 +12,10 @@ import time
 import json
 
 import sys
+# use local version of transformers for training. 
 sys.path.append('.')
-sys.path.append('./transformers')
-sys.path.append('./transformers/')
+sys.path.append('./transformers_local')
+sys.path.append('./transformers_local/')
 
 import numpy as np
 import torch
@@ -28,7 +29,7 @@ except:
 
 from tqdm import tqdm, trange
 
-from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,GPT2Config, GPT2DoubleHeadsModel, GPT2Tokenizer)
+from transformers_local import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,GPT2Config, GPT2DoubleHeadsModel, GPT2Tokenizer)
 
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -363,9 +364,9 @@ def train(args, train_dataset, model, tokenizer):
         for step, batch in enumerate(train_dataloader):
             # inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
             # logger.info(f"  PROGRESS: {float(global_step)/t_total*100}%")
-            log_every_n_interval(500, f"  PROGRESS: {int(float(global_step)/t_total*100)}%")
+            log_every_n_interval(500, f"  PROGRESS: {round(float(global_step)/t_total*100, 3)}%")
             if step % 500 == 0:
-                logger.info(f"  PROGRESS: {int(float(global_step)/t_total*100)}%")
+                logger.info(f"  PROGRESS: {round(float(global_step)/t_total*100,3)}%")
             inputs, tokens, labels, masks,mc_labels, mc_token_ids = batch
 
             inputs = inputs.to(args.device)
@@ -457,7 +458,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
     # multi-gpu evaluate
-    if args.n_gpu > 1:
+    if args.n_gpu > 1 and not isinstance(model, torch.nn.parallel.DataParallel):
         model = torch.nn.DataParallel(model)
 
     # Eval!
@@ -471,24 +472,29 @@ def evaluate(args, model, tokenizer, prefix=""):
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         # inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
 
-        inputs, tokens, labels, masks = batch
+        # inputs, tokens, labels, masks = batch
+        inputs, tokens, labels, masks, mc_labels, mc_token_ids = batch
+
             # import pdb
             # pdb.set_trace()
         inputs = inputs.to(args.device)
         tokens = tokens.to(args.device)
         labels = labels.to(args.device)
         masks = masks.to(args.device)
+        mc_labels = mc_labels.to(args.device)
+        mc_token_ids = mc_token_ids.to(args.device)
         # inputs = inputs.to(args.device)
         # labels = labels.to(args.device)
 
         with torch.no_grad():
-            outputs = model(inputs, masked_lm_labels=labels, token_type_ids=tokens) if args.mlm else model(inputs, labels=labels)
+            # outputs = model(inputs, masked_lm_labels=labels, token_type_ids=tokens) if args.mlm else model(inputs, lm_labels=labels, token_type_ids=tokens, attention_mask=masks)
+            outputs = model(inputs, lm_labels=labels, mc_labels=mc_labels, mc_token_ids=mc_token_ids, token_type_ids=tokens, attention_mask=masks)
             lm_loss = outputs[0]
             eval_loss += lm_loss.mean().item()
         nb_eval_steps += 1
 
     eval_loss = eval_loss / nb_eval_steps
-    perplexity = torch.exp(torch.tensor(eval_loss))
+    perplexity = torch.exp(torch.tensor(eval_loss)).item()
 
     result = {
         "perplexity": perplexity
@@ -596,7 +602,7 @@ def main():
     parser.add_argument('--text_chunk', action='store_true', help="")
     parser.add_argument('--with_LM', type=bool, default=True, help="")
 
-    parser.add_argument("--max_seq", default=200, type=int, help="")
+    parser.add_argument("--max_seq", default=256, type=int, help="")
     parser.add_argument("--max_turn", default=1, type=int, help="")
     parser.add_argument("--mc_loss_efficient", default=1, type=float, help="")
     parser.add_argument("--num_candidates", default=1, type=int, help="")
@@ -718,19 +724,26 @@ def main():
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
         checkpoints = [args.output_dir]
-        if args.eval_all_checkpoints:
-            checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
-            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        # always evaluate all checkpoints
+        # if args.eval_all_checkpoints:
+        checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+        logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
             
             model = model_class.from_pretrained(checkpoint)
+            model.eval()
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=prefix)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+            logger.info(f"checkpoint: {checkpoint}")
+            logger.info(f"Result: {result}")
             results.update(result)
+
+    json.dump(results, fp=open(args.output_dir + "/eval_results.json", "w"), indent=2)
+    logger.info(results)
 
     return results
 
